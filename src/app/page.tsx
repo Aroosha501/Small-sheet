@@ -1,1072 +1,919 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
-type CellStyle = {
-  bold?: boolean;
-  italic?: boolean;
-  align?: "left" | "center" | "right";
-  color?: string;
-  backgroundColor?: string;
-};
+import {
+  evaluateWorkbook,
+  getAffectedCells,
+} from "./lib/formula";
+
+import {
+  createDefaultFixtures,
+  createEmptySheet,
+} from "./lib/fixtures";
 
 type Sheet = {
   id: string;
   name: string;
   cells: Record<string, string>;
-  styles: Record<string, CellStyle>;
+};
+
+type Position = {
+  row: number;
+  col: number;
 };
 
 type Selection = {
-  start: string;
-  end: string;
+  start: Position;
+  end: Position;
 };
 
-type History = {
-  past: Record<string, string>[];
-  present: Record<string, string>;
-  future: Record<string, string>[];
+type SaveState = "saved" | "saving" | "failed";
+
+type HistoryState = {
+  sheets: Sheet[];
+  activeSheetId: string;
+  selection: Selection;
 };
 
-const STORAGE_KEY = "small-sheet-workbook";
-const COLUMNS = ["A", "B", "C", "D", "E", "F", "G", "H"];
-const ROWS = Array.from({ length: 20 }, (_, index) => index + 1);
+const COLUMN_COUNT = 12;
+const INITIAL_ROW_COUNT = 10000;
+const ROW_HEIGHT = 32;
+const HEADER_HEIGHT = 34;
+const ROW_HEADER_WIDTH = 52;
+const DEFAULT_COLUMN_WIDTH = 120;
+const MAX_PASTE_CELLS = 50000;
 
-function getColumnNumber(column: string) {
-  let number = 0;
-
-  for (const character of column) {
-    number = number * 26 + character.charCodeAt(0) - 64;
-  }
-
-  return number;
-}
-
-function getColumnName(number: number) {
+function columnName(number: number): string {
   let result = "";
+  let current = number;
 
-  while (number > 0) {
-    const remainder = (number - 1) % 26;
+  while (current > 0) {
+    const remainder = (current - 1) % 26;
     result = String.fromCharCode(65 + remainder) + result;
-    number = Math.floor((number - 1) / 26);
+    current = Math.floor((current - 1) / 26);
   }
 
   return result;
 }
 
-function getCellAddress(row: number, column: string) {
-  return `${column}${row}`;
-}
+function columnNumber(column: string): number {
+  let result = 0;
 
-function getCellPosition(address: string) {
-  const match = address.match(/^([A-Z]+)(\d+)$/);
-
-  if (!match) {
-    return null;
+  for (const character of column.toUpperCase()) {
+    result = result * 26 + character.charCodeAt(0) - 64;
   }
 
+  return result;
+}
+
+function addressOf(position: Position): string {
+  return `${columnName(position.col)}${position.row}`;
+}
+
+function parseAddress(address: string): Position | null {
+  const match = address.toUpperCase().match(/^([A-Z]+)([1-9]\d*)$/);
+
+  if (!match) return null;
+
   return {
-    column: getColumnNumber(match[1]),
+    col: columnNumber(match[1]),
     row: Number(match[2]),
   };
 }
 
-function getRangeAddresses(start: string, end: string) {
-  const first = getCellPosition(start);
-  const last = getCellPosition(end);
+function cloneSheets(sheets: Sheet[]): Sheet[] {
+  return sheets.map((sheet) => ({
+    ...sheet,
+    cells: { ...sheet.cells },
+  }));
+}
 
-  if (!first || !last) {
-    return [start];
-  }
+function createId(): string {
+  return `sheet-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
-  const minRow = Math.min(first.row, last.row);
-  const maxRow = Math.max(first.row, last.row);
-  const minColumn = Math.min(first.column, last.column);
-  const maxColumn = Math.max(first.column, last.column);
+function getSelectedPositions(selection: Selection): Position[] {
+  const minRow = Math.min(selection.start.row, selection.end.row);
+  const maxRow = Math.max(selection.start.row, selection.end.row);
+  const minCol = Math.min(selection.start.col, selection.end.col);
+  const maxCol = Math.max(selection.start.col, selection.end.col);
 
-  const addresses: string[] = [];
+  const positions: Position[] = [];
 
   for (let row = minRow; row <= maxRow; row++) {
-    for (let column = minColumn; column <= maxColumn; column++) {
-      addresses.push(`${getColumnName(column)}${row}`);
+    for (let col = minCol; col <= maxCol; col++) {
+      positions.push({ row, col });
     }
   }
 
-  return addresses;
+  return positions;
 }
 
-function parseCSV(text: string) {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let value = "";
-  let insideQuotes = false;
+function getRangeAddress(selection: Selection): string {
+  const first = addressOf(selection.start);
+  const last = addressOf(selection.end);
 
-  for (let index = 0; index < text.length; index++) {
-    const character = text[index];
-    const nextCharacter = text[index + 1];
-
-    if (character === '"' && insideQuotes && nextCharacter === '"') {
-      value += '"';
-      index++;
-    } else if (character === '"') {
-      insideQuotes = !insideQuotes;
-    } else if (character === "," && !insideQuotes) {
-      row.push(value);
-      value = "";
-    } else if ((character === "\n" || character === "\r") && !insideQuotes) {
-      if (character === "\r" && nextCharacter === "\n") {
-        index++;
-      }
-
-      row.push(value);
-      rows.push(row);
-      row = [];
-      value = "";
-    } else {
-      value += character;
-    }
-  }
-
-  row.push(value);
-
-  if (row.length > 1 || row[0] !== "" || rows.length === 0) {
-    rows.push(row);
-  }
-
-  return rows;
+  return first === last ? first : `${first}:${last}`;
 }
 
-function escapeCSV(value: string) {
-  if (/[",\r\n]/.test(value)) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-
-  return value;
-}
-
-function evaluateArithmetic(expression: string): number {
-  const matchedTokens = expression.match(/\d+(?:\.\d+)?|[()+\-*/]/g);
-  const tokens: string[] = matchedTokens || [];
-
-  if (
-    tokens.length === 0 ||
-    tokens.join("") !== expression.replace(/\s/g, "")
-  ) {
-    throw new Error("Invalid formula");
-  }
-
-  let position = 0;
-
-  function parseExpression(): number {
-    let result = parseTerm();
-
-    while (
-      tokens[position] === "+" ||
-      tokens[position] === "-"
-    ) {
-      const operator = tokens[position++];
-      const right = parseTerm();
-
-      result =
-        operator === "+"
-          ? result + right
-          : result - right;
-    }
-
-    return result;
-  }
-
-  function parseTerm(): number {
-    let result = parseFactor();
-
-    while (
-      tokens[position] === "*" ||
-      tokens[position] === "/"
-    ) {
-      const operator = tokens[position++];
-      const right = parseFactor();
-
-      if (operator === "/" && right === 0) {
-        throw new Error("Division by zero");
-      }
-
-      result =
-        operator === "*"
-          ? result * right
-          : result / right;
-    }
-
-    return result;
-  }
-
-  function parseFactor(): number {
-    const token = tokens[position];
-
-    if (token === "+") {
-      position++;
-      return parseFactor();
-    }
-
-    if (token === "-") {
-      position++;
-      return -parseFactor();
-    }
-
-    if (token === "(") {
-      position++;
-
-      const result = parseExpression();
-
-      if (tokens[position] !== ")") {
-        throw new Error("Missing closing bracket");
-      }
-
-      position++;
-      return result;
-    }
-
-    if (!token || !/^\d+(?:\.\d+)?$/.test(token)) {
-      throw new Error("Invalid formula");
-    }
-
-    position++;
-
-    return Number(token);
-  }
-
-  const result = parseExpression();
-
-  if (position !== tokens.length || !Number.isFinite(result)) {
-    throw new Error("Invalid formula");
-  }
-
-  return result;
-}
-function calculateCell(
-  address: string,
-  cells: Record<string, string>,
-  visiting = new Set<string>()
-): string {
-  const rawValue = cells[address] ?? "";
-
-  if (!rawValue.startsWith("=")) {
-    return rawValue;
-  }
-
-  if (visiting.has(address)) {
-    return "#CIRCULAR!";
-  }
-
-  const nextVisiting = new Set(visiting);
-  nextVisiting.add(address);
-
-  try {
-    let expression = rawValue.slice(1).trim();
-
-    const functionMatch = expression.match(
-      /^(SUM|AVERAGE|COUNT|MIN|MAX)\(([A-Z]+\d+):([A-Z]+\d+)\)$/i
-    );
-
-    if (functionMatch) {
-      const functionName = functionMatch[1].toUpperCase();
-      const addresses = getRangeAddresses(
-        functionMatch[2],
-        functionMatch[3]
-      );
-
-      const values = addresses.map((cellAddress) => {
-        const result = calculateCell(cellAddress, cells, nextVisiting);
-
-        if (result === "#CIRCULAR!" || result === "#ERROR!") {
-          throw new Error("Invalid referenced cell");
-        }
-
-        const number = Number(result);
-        return result.trim() !== "" && Number.isFinite(number)
-          ? number
-          : null;
-      });
-
-      const numbers = values.filter(
-        (value): value is number => value !== null
-      );
-
-      if (functionName === "COUNT") {
-        return String(numbers.length);
-      }
-
-      if (numbers.length === 0) {
-        return "0";
-      }
-
-      if (functionName === "SUM") {
-        return String(numbers.reduce((total, value) => total + value, 0));
-      }
-
-      if (functionName === "AVERAGE") {
-        return String(
-          numbers.reduce((total, value) => total + value, 0) /
-            numbers.length
-        );
-      }
-
-      if (functionName === "MIN") {
-        return String(Math.min(...numbers));
-      }
-
-      return String(Math.max(...numbers));
-    }
-
-    expression = expression.replace(
-      /([A-Z]+\d+)/g,
-      (reference) => {
-        const result = calculateCell(reference, cells, nextVisiting);
-
-        if (result === "#CIRCULAR!" || result === "#ERROR!") {
-          throw new Error("Invalid referenced cell");
-        }
-
-        if (result.trim() === "") {
-          return "0";
-        }
-
-        const number = Number(result);
-
-        if (!Number.isFinite(number)) {
-          throw new Error("Referenced cell is not a number");
-        }
-
-        return String(number);
-      }
-    );
-
-    return String(evaluateArithmetic(expression));
-  } catch {
-    return "#ERROR!";
-  }
+function getInitialSelection(): Selection {
+  return {
+    start: { row: 1, col: 1 },
+    end: { row: 1, col: 1 },
+  };
 }
 
 export default function Home() {
-  const [sheets, setSheets] = useState<Sheet[]>([
-    {
-      id: "sheet-1",
-      name: "Sheet1",
-      cells: {},
-      styles: {},
-    },
-  ]);
+  const [sheets, setSheets] = useState<Sheet[]>([]);
+  const [activeSheetId, setActiveSheetId] = useState("budget");
+  const [selection, setSelection] = useState<Selection>(
+    getInitialSelection,
+  );
 
-  const [activeSheetId, setActiveSheetId] = useState("sheet-1");
-  const [cellValues, setCellValues] = useState<Record<string, string>>({});
-  const [cellStyles, setCellStyles] = useState<Record<string, CellStyle>>({});
-  const [activeCell, setActiveCell] = useState("A1");
-  const [selectedRange, setSelectedRange] = useState<Selection>({
-    start: "A1",
-    end: "A1",
-  });
   const [editingCell, setEditingCell] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [saveStatus, setSaveStatus] = useState("Loading...");
-  const [isLoaded, setIsLoaded] = useState(false);
+  const [formulaDraft, setFormulaDraft] = useState("");
 
-  const historyRef = useRef<Record<string, History>>({});
-  const nextSheetNumberRef = useRef(2);
-  const csvInputRef = useRef<HTMLInputElement | null>(null);
-  const jsonInputRef = useRef<HTMLInputElement | null>(null);
-  const isDraggingRef = useRef(false);
+  const [saveState, setSaveState] = useState<SaveState>("saved");
+  const [saveMessage, setSaveMessage] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState("");
 
-  const activeSheet = sheets.find((sheet) => sheet.id === activeSheetId);
+  const [darkMode, setDarkMode] = useState(false);
+  const [columnWidths, setColumnWidths] = useState<Record<number, number>>(
+    {},
+  );
 
-  const getCommittedCells = useCallback(() => {
-    if (!editingCell) {
-      return cellValues;
+  const [renamingSheetId, setRenamingSheetId] = useState<string | null>(
+    null,
+  );
+  const [renameValue, setRenameValue] = useState("");
+
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(600);
+  const [draggingSelection, setDraggingSelection] = useState(false);
+
+  const [history, setHistory] = useState<HistoryState[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+
+  const gridRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<HTMLInputElement>(null);
+  const formulaRef = useRef<HTMLInputElement>(null);
+  const resizeRef = useRef<{
+    col: number;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
+
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveSequenceRef = useRef(0);
+  const latestSequenceRef = useRef(0);
+  const isSavingRef = useRef(false);
+  const queuedSaveRef = useRef<Sheet[] | null>(null);
+  const initializedRef = useRef(false);
+  const skipNextHistoryRef = useRef(false);
+
+  const activeSheet = useMemo(
+    () => sheets.find((sheet) => sheet.id === activeSheetId) ?? null,
+    [sheets, activeSheetId],
+  );
+
+  const activeAddress = addressOf(selection.start);
+  const selectedAddress = getRangeAddress(selection);
+
+  const formulaResults = useMemo(() => {
+    if (!activeSheet) {
+      return {
+        values: {},
+        dependencies: {},
+        dependents: {},
+      };
     }
 
-    const next = { ...cellValues };
+    return evaluateWorkbook(activeSheet.cells);
+  }, [activeSheet]);
 
-    if (draft === "") {
-      delete next[editingCell];
-    } else {
-      next[editingCell] = draft;
+  const activeRawValue = activeSheet?.cells[activeAddress] ?? "";
+
+  const activeDisplayValue =
+    formulaResults.values[activeAddress] ?? activeRawValue;
+
+  const selectedPositions = useMemo(
+    () => getSelectedPositions(selection),
+    [selection],
+  );
+
+  const selectionStats = useMemo(() => {
+    if (!activeSheet) {
+      return { sum: 0, average: 0, count: 0 };
     }
 
-    return next;
-  }, [cellValues, draft, editingCell]);
+    const numbers: number[] = [];
 
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
+    for (const position of selectedPositions) {
+      const address = addressOf(position);
+      const value = formulaResults.values[address] ?? "";
 
-      if (saved) {
-        const parsed = JSON.parse(saved);
+      if (value.trim() === "") continue;
 
-        if (Array.isArray(parsed.sheets) && parsed.sheets.length > 0) {
-          const loadedSheets: Sheet[] = parsed.sheets.map(
-            (sheet: Partial<Sheet>, index: number) => ({
-              id: sheet.id || `sheet-${index + 1}`,
-              name: sheet.name || `Sheet${index + 1}`,
-              cells: sheet.cells || {},
-              styles: sheet.styles || {},
-            })
-          );
+      const number = Number(value);
 
-          const savedActiveId = loadedSheets.some(
-            (sheet) => sheet.id === parsed.activeSheetId
-          )
-            ? parsed.activeSheetId
-            : loadedSheets[0].id;
-
-          setSheets(loadedSheets);
-          setActiveSheetId(savedActiveId);
-
-          const selectedSheet = loadedSheets.find(
-            (sheet) => sheet.id === savedActiveId
-          );
-
-          setCellValues(selectedSheet?.cells || {});
-          setCellStyles(selectedSheet?.styles || {});
-
-          loadedSheets.forEach((sheet) => {
-            historyRef.current[sheet.id] = {
-              past: [],
-              present: sheet.cells || {},
-              future: [],
-            };
-          });
-
-          const highestNumber = loadedSheets.reduce((highest, sheet) => {
-            const match = sheet.id.match(/sheet-(\d+)/);
-            return Math.max(highest, match ? Number(match[1]) : 0);
-          }, 1);
-
-          nextSheetNumberRef.current = Math.max(
-            parsed.nextSheetNumber || 2,
-            highestNumber + 1
-          );
-        }
+      if (Number.isFinite(number)) {
+        numbers.push(number);
       }
-    } catch {
-      setSaveStatus("Load failed");
     }
 
-    setIsLoaded(true);
+    const sum = numbers.reduce((total, value) => total + value, 0);
+
+    return {
+      sum,
+      average: numbers.length ? sum / numbers.length : 0,
+      count: numbers.length,
+    };
+  }, [activeSheet, selectedPositions, formulaResults]);
+
+  const firstVisibleRow = Math.max(
+    1,
+    Math.floor(scrollTop / ROW_HEIGHT) + 1,
+  );
+
+  const visibleRowCount = Math.ceil(viewportHeight / ROW_HEIGHT) + 5;
+
+  const lastVisibleRow = Math.min(
+    INITIAL_ROW_COUNT,
+    firstVisibleRow + visibleRowCount,
+  );
+
+  const visibleRows = useMemo(() => {
+    const rows: number[] = [];
+
+    for (let row = firstVisibleRow; row <= lastVisibleRow; row++) {
+      rows.push(row);
+    }
+
+    return rows;
+  }, [firstVisibleRow, lastVisibleRow]);
+
+  const isSelected = useCallback(
+    (row: number, col: number) => {
+      const minRow = Math.min(selection.start.row, selection.end.row);
+      const maxRow = Math.max(selection.start.row, selection.end.row);
+      const minCol = Math.min(selection.start.col, selection.end.col);
+      const maxCol = Math.max(selection.start.col, selection.end.col);
+
+      return (
+        row >= minRow &&
+        row <= maxRow &&
+        col >= minCol &&
+        col <= maxCol
+      );
+    },
+    [selection],
+  );
+
+  const updateURL = useCallback(
+    (sheetId: string, address: string) => {
+      if (typeof window === "undefined") return;
+
+      const url = new URL(window.location.href);
+
+      url.searchParams.set("sheet", sheetId);
+      url.searchParams.set("cell", address);
+
+      window.history.pushState({}, "", url);
+    },
+    [],
+  );
+
+  const recordHistory = useCallback(
+    (nextSheets: Sheet[], nextSheetId: string, nextSelection: Selection) => {
+      const snapshot: HistoryState = {
+        sheets: cloneSheets(nextSheets),
+        activeSheetId: nextSheetId,
+        selection: {
+          start: { ...nextSelection.start },
+          end: { ...nextSelection.end },
+        },
+      };
+
+      setHistory((previous) => {
+        const base =
+          historyIndex >= 0
+            ? previous.slice(0, historyIndex + 1)
+            : [];
+
+        const next = [...base, snapshot];
+
+        if (next.length > 100) next.shift();
+
+        setHistoryIndex(next.length - 1);
+
+        return next;
+      });
+    },
+    [historyIndex],
+  );
+
+  // Load saved workbook or start with deterministic fixtures.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadWorkbook() {
+      try {
+        const response = await fetch("/api/sheets", {
+          cache: "no-store",
+        });
+
+        if (!response.ok) {
+          throw new Error("Could not load saved workbook.");
+        }
+
+        const result = await response.json();
+
+        if (cancelled) return;
+
+        let loadedSheets: Sheet[];
+
+        if (
+          result.workbook &&
+          Array.isArray(result.workbook.sheets) &&
+          result.workbook.sheets.length > 0
+        ) {
+          loadedSheets = result.workbook.sheets;
+        } else {
+          loadedSheets = createDefaultFixtures();
+        }
+
+        setSheets(loadedSheets);
+
+        const url = new URL(window.location.href);
+        const requestedSheet = url.searchParams.get("sheet");
+        const requestedCell = url.searchParams.get("cell");
+
+        const initialSheet =
+          loadedSheets.find((sheet) => sheet.id === requestedSheet) ??
+          loadedSheets[0];
+
+        const initialPosition = requestedCell
+          ? parseAddress(requestedCell)
+          : null;
+
+        const initialSelection: Selection = {
+          start: initialPosition ?? { row: 1, col: 1 },
+          end: initialPosition ?? { row: 1, col: 1 },
+        };
+
+        setActiveSheetId(initialSheet.id);
+        setSelection(initialSelection);
+
+        setHistory([
+          {
+            sheets: cloneSheets(loadedSheets),
+            activeSheetId: initialSheet.id,
+            selection: initialSelection,
+          },
+        ]);
+
+        setHistoryIndex(0);
+        initializedRef.current = true;
+        setLoaded(true);
+      } catch {
+        if (cancelled) return;
+
+        setLoadError(
+          "Unable to load the workbook from the server. You can reset the fixtures and try again.",
+        );
+
+        const fallbackSheets = createDefaultFixtures();
+
+        setSheets(fallbackSheets);
+        setActiveSheetId(fallbackSheets[0].id);
+
+        const initialSelection = getInitialSelection();
+
+        setHistory([
+          {
+            sheets: cloneSheets(fallbackSheets),
+            activeSheetId: fallbackSheets[0].id,
+            selection: initialSelection,
+          },
+        ]);
+
+        setHistoryIndex(0);
+        initializedRef.current = true;
+        setLoaded(true);
+      }
+    }
+
+    loadWorkbook();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
+  // Update formula bar when the active cell changes.
   useEffect(() => {
-    if (!isLoaded) {
+    if (!editingCell) {
+      setFormulaDraft(activeRawValue);
+    }
+  }, [activeRawValue, editingCell]);
+
+  // Track grid viewport size.
+  useEffect(() => {
+    const element = gridRef.current;
+
+    if (!element) return;
+
+    const updateSize = () => {
+      setViewportHeight(element.clientHeight);
+    };
+
+    updateSize();
+
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+
+    return () => observer.disconnect();
+  }, [loaded]);
+
+  // Save changes with a debounce.
+  useEffect(() => {
+    if (!loaded || !initializedRef.current || sheets.length === 0) {
       return;
     }
 
-    try {
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({
-          sheets,
-          activeSheetId,
-          nextSheetNumber: nextSheetNumberRef.current,
-        })
-      );
-
-      setSaveStatus("Saved");
-    } catch {
-      setSaveStatus("Save failed");
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
     }
-  }, [sheets, activeSheetId, isLoaded]);
 
-  useEffect(() => {
-    const stopDragging = () => {
-      isDraggingRef.current = false;
-    };
+    setSaveState("saving");
+    setSaveMessage("");
 
-    window.addEventListener("mouseup", stopDragging);
+    const snapshot = cloneSheets(sheets);
+    const sequence = ++saveSequenceRef.current;
+
+    latestSequenceRef.current = sequence;
+
+    saveTimerRef.current = setTimeout(() => {
+      void saveWorkbook(snapshot, sequence);
+    }, 700);
 
     return () => {
-      window.removeEventListener("mouseup", stopDragging);
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+      }
     };
-  }, []);
+  }, [sheets, loaded]);
 
-  const updateSheetData = useCallback(
-    (
-      nextCells: Record<string, string>,
-      nextStyles: Record<string, CellStyle> = cellStyles
-    ) => {
-      setCellValues(nextCells);
-      setCellStyles(nextStyles);
+  async function saveWorkbook(snapshot: Sheet[], sequence: number) {
+    if (isSavingRef.current) {
+      queuedSaveRef.current = snapshot;
+      return;
+    }
 
-      setSheets((currentSheets) =>
-        currentSheets.map((sheet) =>
-          sheet.id === activeSheetId
-            ? {
-                ...sheet,
-                cells: nextCells,
-                styles: nextStyles,
-              }
-            : sheet
-        )
+    isSavingRef.current = true;
+
+    try {
+      const response = await fetch("/api/sheets", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ sheets: snapshot }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.message ?? "Save failed.");
+      }
+
+      if (sequence === latestSequenceRef.current) {
+        setSaveState("saved");
+        setSaveMessage("");
+      }
+    } catch (error) {
+      if (sequence === latestSequenceRef.current) {
+        setSaveState("failed");
+        setSaveMessage(
+          error instanceof Error ? error.message : "Save failed.",
+        );
+      }
+    } finally {
+      isSavingRef.current = false;
+
+      const queued = queuedSaveRef.current;
+      queuedSaveRef.current = null;
+
+      if (queued) {
+        const nextSequence = ++saveSequenceRef.current;
+        latestSequenceRef.current = nextSequence;
+
+        void saveWorkbook(queued, nextSequence);
+      }
+    }
+  }
+
+  const commitCell = useCallback(
+    (address: string, value: string) => {
+      if (!activeSheet) return;
+
+      const nextSheets = cloneSheets(sheets);
+      const target = nextSheets.find(
+        (sheet) => sheet.id === activeSheetId,
       );
+
+      if (!target) return;
+
+      if (value === "") {
+        delete target.cells[address];
+      } else {
+        target.cells[address] = value;
+      }
+
+      setSheets(nextSheets);
+
+      recordHistory(nextSheets, activeSheetId, selection);
     },
-    [activeSheetId, cellStyles]
-  );
-
-  const commitCells = useCallback(
-    (nextCells: Record<string, string>) => {
-      const history = historyRef.current[activeSheetId] || {
-        past: [],
-        present: cellValues,
-        future: [],
-      };
-
-      historyRef.current[activeSheetId] = {
-        past: [...history.past, history.present].slice(-100),
-        present: nextCells,
-        future: [],
-      };
-
-      updateSheetData(nextCells);
-    },
-    [activeSheetId, cellValues, updateSheetData]
+    [activeSheet, sheets, activeSheetId, selection, recordHistory],
   );
 
   const finishEditing = useCallback(
-    (moveTo?: string) => {
-      if (editingCell) {
-        const nextCells = { ...cellValues };
+    (move?: "up" | "down" | "left" | "right") => {
+      if (!editingCell) return;
 
-        if (draft === "") {
-          delete nextCells[editingCell];
-        } else {
-          nextCells[editingCell] = draft;
+      const address = editingCell;
+
+      setEditingCell(null);
+
+      if (activeSheet) {
+        const current = activeSheet.cells[address] ?? "";
+
+        if (current !== draft) {
+          commitCell(address, draft);
         }
-
-        commitCells(nextCells);
-        setEditingCell(null);
       }
 
-      if (moveTo) {
-        setActiveCell(moveTo);
-        setSelectedRange({ start: moveTo, end: moveTo });
+      if (move) {
+        const next = { ...selection.start };
+
+        if (move === "up") next.row = Math.max(1, next.row - 1);
+        if (move === "down") next.row += 1;
+        if (move === "left") next.col = Math.max(1, next.col - 1);
+        if (move === "right") next.col += 1;
+
+        const nextSelection = {
+          start: next,
+          end: next,
+        };
+
+        setSelection(nextSelection);
+        updateURL(activeSheetId, addressOf(next));
       }
     },
-    [cellValues, commitCells, draft, editingCell]
+    [
+      editingCell,
+      draft,
+      activeSheet,
+      commitCell,
+      selection,
+      activeSheetId,
+      updateURL,
+    ],
   );
 
-  const startEditing = useCallback(
-    (address: string, initialValue?: string) => {
-      setActiveCell(address);
-      setSelectedRange({ start: address, end: address });
-      setEditingCell(address);
-      setDraft(
-        initialValue !== undefined ? initialValue : cellValues[address] || ""
-      );
-    },
-    [cellValues]
-  );
+  function startEditing(address: string, initialValue?: string) {
+    const value = initialValue ?? activeSheet?.cells[address] ?? "";
 
-  const undo = useCallback(() => {
-    const history = historyRef.current[activeSheetId];
+    setEditingCell(address);
+    setDraft(value);
 
-    if (!history || history.past.length === 0) {
-      return;
-    }
-
-    const previous = history.past[history.past.length - 1];
-
-    historyRef.current[activeSheetId] = {
-      past: history.past.slice(0, -1),
-      present: previous,
-      future: [history.present, ...history.future],
-    };
-
-    updateSheetData(previous);
-    setEditingCell(null);
-  }, [activeSheetId, updateSheetData]);
-
-  const redo = useCallback(() => {
-    const history = historyRef.current[activeSheetId];
-
-    if (!history || history.future.length === 0) {
-      return;
-    }
-
-    const next = history.future[0];
-
-    historyRef.current[activeSheetId] = {
-      past: [...history.past, history.present],
-      present: next,
-      future: history.future.slice(1),
-    };
-
-    updateSheetData(next);
-    setEditingCell(null);
-  }, [activeSheetId, updateSheetData]);
-
-  const createSheet = () => {
-    const committedCells = getCommittedCells();
-    const currentSheets = sheets.map((sheet) =>
-      sheet.id === activeSheetId
-        ? { ...sheet, cells: committedCells, styles: cellStyles }
-        : sheet
-    );
-
-    const number = nextSheetNumberRef.current++;
-    const newSheet: Sheet = {
-      id: `sheet-${number}`,
-      name: `Sheet${number}`,
-      cells: {},
-      styles: {},
-    };
-
-    historyRef.current[activeSheetId] = {
-      ...(historyRef.current[activeSheetId] || {
-        past: [],
-        future: [],
-      }),
-      present: committedCells,
-    };
-
-    historyRef.current[newSheet.id] = {
-      past: [],
-      present: {},
-      future: [],
-    };
-
-    setSheets([...currentSheets, newSheet]);
-    setActiveSheetId(newSheet.id);
-    setCellValues({});
-    setCellStyles({});
-    setActiveCell("A1");
-    setSelectedRange({ start: "A1", end: "A1" });
-    setEditingCell(null);
-  };
-
-  const switchSheet = (sheetId: string) => {
-    if (sheetId === activeSheetId) {
-      return;
-    }
-
-    const committedCells = getCommittedCells();
-
-    const updatedSheets = sheets.map((sheet) =>
-      sheet.id === activeSheetId
-        ? { ...sheet, cells: committedCells, styles: cellStyles }
-        : sheet
-    );
-
-    const targetSheet = updatedSheets.find((sheet) => sheet.id === sheetId);
-
-    if (!targetSheet) {
-      return;
-    }
-
-    historyRef.current[activeSheetId] = {
-      ...(historyRef.current[activeSheetId] || {
-        past: [],
-        future: [],
-      }),
-      present: committedCells,
-    };
-
-    setSheets(updatedSheets);
-    setActiveSheetId(sheetId);
-    setCellValues(targetSheet.cells);
-    setCellStyles(targetSheet.styles || {});
-    setActiveCell("A1");
-    setSelectedRange({ start: "A1", end: "A1" });
-    setEditingCell(null);
-  };
-
-  const renameSheet = (sheetId: string) => {
-    const sheet = sheets.find((item) => item.id === sheetId);
-
-    if (!sheet) {
-      return;
-    }
-
-    const newName = window.prompt("Enter the new sheet name:", sheet.name);
-
-    if (newName && newName.trim()) {
-      setSheets((currentSheets) =>
-        currentSheets.map((item) =>
-          item.id === sheetId
-            ? { ...item, name: newName.trim() }
-            : item
-        )
-      );
-    }
-  };
-
-  const deleteSheet = () => {
-    if (sheets.length <= 1) {
-      window.alert("You must keep at least one sheet.");
-      return;
-    }
-
-    const sheet = sheets.find((item) => item.id === activeSheetId);
-
-    if (!sheet || !window.confirm(`Delete "${sheet.name}"?`)) {
-      return;
-    }
-
-    const committedCells = getCommittedCells();
-
-    const updatedSheets = sheets.map((item) =>
-      item.id === activeSheetId
-        ? { ...item, cells: committedCells, styles: cellStyles }
-        : item
-    );
-
-    const remainingSheets = updatedSheets.filter(
-      (item) => item.id !== activeSheetId
-    );
-
-    delete historyRef.current[activeSheetId];
-
-    const nextSheet = remainingSheets[0];
-
-    setSheets(remainingSheets);
-    setActiveSheetId(nextSheet.id);
-    setCellValues(nextSheet.cells);
-    setCellStyles(nextSheet.styles || {});
-    setActiveCell("A1");
-    setSelectedRange({ start: "A1", end: "A1" });
-    setEditingCell(null);
-  };
-
-  const applyStyle = (style: Partial<CellStyle>) => {
-    const addresses = getRangeAddresses(
-      selectedRange.start,
-      selectedRange.end
-    );
-
-    const nextStyles = { ...cellStyles };
-
-    addresses.forEach((address) => {
-      nextStyles[address] = {
-        ...nextStyles[address],
-        ...style,
-      };
+    requestAnimationFrame(() => {
+      editorRef.current?.focus();
+      editorRef.current?.select();
     });
+  }
 
-    updateSheetData(getCommittedCells(), nextStyles);
-  };
+  function selectCell(row: number, col: number, extend = false) {
+  const position = { row, col };
 
-  const toggleStyle = (property: "bold" | "italic") => {
-    const currentStyle = cellStyles[activeCell]?.[property];
-
-    applyStyle({ [property]: !currentStyle });
-  };
-
-  const clearSelectedCells = () => {
-    const nextCells = { ...cellValues };
-
-    getRangeAddresses(selectedRange.start, selectedRange.end).forEach(
-      (address) => {
-        delete nextCells[address];
+  const nextSelection = extend
+    ? {
+        start: selection.start,
+        end: position,
       }
+    : {
+        start: position,
+        end: position,
+      };
+
+  // Update React state outside any state updater callback.
+  setSelection(nextSelection);
+
+  // Update the URL after calculating the selection.
+  updateURL(activeSheetId, addressOf(position));
+}
+
+  function switchSheet(sheetId: string) {
+    if (editingCell) finishEditing();
+
+    setActiveSheetId(sheetId);
+
+    const nextSelection = getInitialSelection();
+    setSelection(nextSelection);
+
+    updateURL(sheetId, "A1");
+
+    recordHistory(sheets, sheetId, nextSelection);
+  }
+
+  function addSheet() {
+    const newSheet = createEmptySheet(
+      createId(),
+      `Sheet ${sheets.length + 1}`,
     );
 
-    commitCells(nextCells);
-    setEditingCell(null);
-  };
+    const nextSheets = [...sheets, newSheet];
 
-  const copySelectedCells = async () => {
-    const start = getCellPosition(selectedRange.start);
-    const end = getCellPosition(selectedRange.end);
+    setSheets(nextSheets);
+    setActiveSheetId(newSheet.id);
 
-    if (!start || !end) {
+    const nextSelection = getInitialSelection();
+    setSelection(nextSelection);
+
+    updateURL(newSheet.id, "A1");
+    recordHistory(nextSheets, newSheet.id, nextSelection);
+  }
+
+  function beginRename(sheet: Sheet) {
+    setRenamingSheetId(sheet.id);
+    setRenameValue(sheet.name);
+  }
+
+  function finishRename() {
+    if (!renamingSheetId) return;
+
+    const name = renameValue.trim();
+
+    if (name) {
+      const nextSheets = sheets.map((sheet) =>
+        sheet.id === renamingSheetId
+          ? { ...sheet, name }
+          : sheet,
+      );
+
+      setSheets(nextSheets);
+      recordHistory(nextSheets, activeSheetId, selection);
+    }
+
+    setRenamingSheetId(null);
+  }
+
+  function deleteActiveSheet() {
+    if (sheets.length <= 1) {
+      alert("You must keep at least one sheet.");
       return;
     }
 
-    const minRow = Math.min(start.row, end.row);
-    const maxRow = Math.max(start.row, end.row);
-    const minColumn = Math.min(start.column, end.column);
-    const maxColumn = Math.max(start.column, end.column);
+    if (!confirm(`Delete "${activeSheet?.name}"?`)) return;
 
-    const rows: string[] = [];
+    const nextSheets = sheets.filter(
+      (sheet) => sheet.id !== activeSheetId,
+    );
+
+    const nextActive = nextSheets[0];
+
+    setSheets(nextSheets);
+    setActiveSheetId(nextActive.id);
+
+    const nextSelection = getInitialSelection();
+    setSelection(nextSelection);
+
+    updateURL(nextActive.id, "A1");
+    recordHistory(nextSheets, nextActive.id, nextSelection);
+  }
+
+  function undo() {
+    if (historyIndex <= 0) return;
+
+    const previous = history[historyIndex - 1];
+
+    setHistoryIndex(historyIndex - 1);
+    setSheets(cloneSheets(previous.sheets));
+    setActiveSheetId(previous.activeSheetId);
+    setSelection(previous.selection);
+    setEditingCell(null);
+
+    updateURL(
+      previous.activeSheetId,
+      addressOf(previous.selection.start),
+    );
+  }
+
+  function redo() {
+    if (historyIndex >= history.length - 1) return;
+
+    const next = history[historyIndex + 1];
+
+    setHistoryIndex(historyIndex + 1);
+    setSheets(cloneSheets(next.sheets));
+    setActiveSheetId(next.activeSheetId);
+    setSelection(next.selection);
+    setEditingCell(null);
+
+    updateURL(next.activeSheetId, addressOf(next.selection.start));
+  }
+
+  function applyFormulaBar() {
+    if (!activeSheet) return;
+
+    commitCell(activeAddress, formulaDraft);
+    formulaRef.current?.blur();
+  }
+
+  async function copySelection() {
+    if (!activeSheet) return;
+
+    const minRow = Math.min(selection.start.row, selection.end.row);
+    const maxRow = Math.max(selection.start.row, selection.end.row);
+    const minCol = Math.min(selection.start.col, selection.end.col);
+    const maxCol = Math.max(selection.start.col, selection.end.col);
+
+    const lines: string[] = [];
 
     for (let row = minRow; row <= maxRow; row++) {
       const values: string[] = [];
 
-      for (let column = minColumn; column <= maxColumn; column++) {
-        const address = `${getColumnName(column)}${row}`;
-        values.push(cellValues[address] || "");
+      for (let col = minCol; col <= maxCol; col++) {
+        const address = addressOf({ row, col });
+        values.push(activeSheet.cells[address] ?? "");
       }
 
-      rows.push(values.join("\t"));
+      lines.push(values.join("\t"));
     }
 
-    await navigator.clipboard.writeText(rows.join("\n"));
-  };
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+    } catch {
+      setSaveMessage("Clipboard permission was not available.");
+    }
+  }
 
-  const pasteCells = async () => {
-    const clipboardText = await navigator.clipboard.readText();
-    const rows = clipboardText.replace(/\r/g, "").split("\n");
+  function pasteText(text: string) {
+    if (!activeSheet) return;
 
-    if (rows.length === 1 && rows[0] === "") {
-      return;
+    const rows = text
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .split("\n");
+
+    if (rows.length && rows[rows.length - 1] === "") {
+      rows.pop();
     }
 
-    const start = getCellPosition(activeCell);
+    const matrix = rows.map((row) => row.split("\t"));
 
-    if (!start) {
-      return;
-    }
-
-    const nextCells = { ...cellValues };
-
-    rows.forEach((row, rowIndex) => {
-      row.split("\t").forEach((value, columnIndex) => {
-        const rowNumber = start.row + rowIndex;
-        const columnNumber = start.column + columnIndex;
-
-        if (
-          rowNumber >= 1 &&
-          rowNumber <= 20 &&
-          columnNumber >= 1 &&
-          columnNumber <= 8
-        ) {
-          const address = `${getColumnName(columnNumber)}${rowNumber}`;
-
-          if (value === "") {
-            delete nextCells[address];
-          } else {
-            nextCells[address] = value;
-          }
-        }
-      });
-    });
-
-    commitCells(nextCells);
-  };
-
-  const exportCSV = () => {
-    const csvRows = ROWS.map((row) =>
-      COLUMNS.map((column) => {
-        const address = getCellAddress(row, column);
-        return escapeCSV(cellValues[address] || "");
-      }).join(",")
+    const totalCells = matrix.reduce(
+      (total, row) => total + row.length,
+      0,
     );
 
-    const blob = new Blob([csvRows.join("\r\n")], {
-      type: "text/csv;charset=utf-8;",
+    if (totalCells > MAX_PASTE_CELLS) {
+      setSaveMessage(
+        "Paste stopped: the maximum supported paste size is 50,000 cells.",
+      );
+      return;
+    }
+
+    const nextSheets = cloneSheets(sheets);
+    const target = nextSheets.find(
+      (sheet) => sheet.id === activeSheetId,
+    );
+
+    if (!target) return;
+
+    matrix.forEach((row, rowIndex) => {
+      row.forEach((value, colIndex) => {
+        const address = addressOf({
+          row: selection.start.row + rowIndex,
+          col: selection.start.col + colIndex,
+        });
+
+        if (value === "") {
+          delete target.cells[address];
+        } else {
+          target.cells[address] = value;
+        }
+      });
     });
 
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
+    setSheets(nextSheets);
 
-    link.href = url;
-    link.download = `${activeSheet?.name || "sheet"}.csv`;
-    link.click();
-
-    URL.revokeObjectURL(url);
-  };
-
-  const importCSV = async (file: File) => {
-    try {
-      const text = await file.text();
-      const rows = parseCSV(text);
-      const nextCells: Record<string, string> = {};
-
-      rows.slice(0, 20).forEach((row, rowIndex) => {
-        row.slice(0, 8).forEach((value, columnIndex) => {
-          if (value !== "") {
-            const address = `${getColumnName(columnIndex + 1)}${rowIndex + 1}`;
-            nextCells[address] = value;
-          }
-        });
-      });
-
-      commitCells(nextCells);
-      setCellStyles({});
-      setSheets((currentSheets) =>
-        currentSheets.map((sheet) =>
-          sheet.id === activeSheetId
-            ? { ...sheet, cells: nextCells, styles: {} }
-            : sheet
-        )
-      );
-      setActiveCell("A1");
-      setSelectedRange({ start: "A1", end: "A1" });
-      setEditingCell(null);
-      setSaveStatus("CSV imported");
-    } catch {
-      window.alert("Could not import this CSV file.");
-    }
-  };
-
-  const exportJSON = () => {
-    const committedCells = getCommittedCells();
-
-    const workbook = {
-      version: 1,
-      activeSheetId,
-      nextSheetNumber: nextSheetNumberRef.current,
-      sheets: sheets.map((sheet) =>
-        sheet.id === activeSheetId
-          ? { ...sheet, cells: committedCells, styles: cellStyles }
-          : sheet
-      ),
+    const end = {
+      row: selection.start.row + matrix.length - 1,
+      col:
+        selection.start.col +
+        Math.max(0, ...matrix.map((row) => row.length)) -
+        1,
     };
 
-    const blob = new Blob([JSON.stringify(workbook, null, 2)], {
-      type: "application/json",
-    });
+    const nextSelection = {
+      start: selection.start,
+      end,
+    };
 
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
+    setSelection(nextSelection);
+    recordHistory(nextSheets, activeSheetId, nextSelection);
+  }
 
-    link.href = url;
-    link.download = "small-sheet-workbook.json";
-    link.click();
+  function handleGridPaste(event: React.ClipboardEvent<HTMLDivElement>) {
+    event.preventDefault();
 
-    URL.revokeObjectURL(url);
-  };
+    const text = event.clipboardData.getData("text/plain");
 
-  const importJSON = async (file: File) => {
-    try {
-      const text = await file.text();
-      const parsed = JSON.parse(text);
+    if (text) pasteText(text);
+  }
 
-      if (
-        !parsed ||
-        !Array.isArray(parsed.sheets) ||
-        parsed.sheets.length === 0
-      ) {
-        throw new Error("Invalid workbook");
-      }
+  function handleGridCopy(event: React.ClipboardEvent<HTMLDivElement>) {
+    event.preventDefault();
+    void copySelection();
+  }
 
-      const importedSheets: Sheet[] = parsed.sheets.map(
-        (sheet: Partial<Sheet>, index: number) => {
-          if (!sheet || typeof sheet.cells !== "object") {
-            throw new Error("Invalid sheet data");
-          }
+  function handleGridKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (editingCell) return;
 
-          return {
-            id: sheet.id || `sheet-${index + 1}`,
-            name: sheet.name || `Sheet${index + 1}`,
-            cells: sheet.cells || {},
-            styles: sheet.styles || {},
-          };
-        }
-      );
+    const key = event.key;
 
-      const importedActiveId = importedSheets.some(
-        (sheet) => sheet.id === parsed.activeSheetId
-      )
-        ? parsed.activeSheetId
-        : importedSheets[0].id;
-
-      const selectedSheet = importedSheets.find(
-        (sheet) => sheet.id === importedActiveId
-      )!;
-
-      historyRef.current = {};
-
-      importedSheets.forEach((sheet) => {
-        historyRef.current[sheet.id] = {
-          past: [],
-          present: sheet.cells,
-          future: [],
-        };
-      });
-
-      const highestNumber = importedSheets.reduce((highest, sheet) => {
-        const match = sheet.id.match(/sheet-(\d+)/);
-        return Math.max(highest, match ? Number(match[1]) : 0);
-      }, 1);
-
-      nextSheetNumberRef.current = Math.max(
-        parsed.nextSheetNumber || 2,
-        highestNumber + 1
-      );
-
-      setSheets(importedSheets);
-      setActiveSheetId(importedActiveId);
-      setCellValues(selectedSheet.cells);
-      setCellStyles(selectedSheet.styles);
-      setActiveCell("A1");
-      setSelectedRange({ start: "A1", end: "A1" });
-      setEditingCell(null);
-      setSaveStatus("Workbook restored");
-    } catch {
-      window.alert("This JSON file is not a valid Small Sheet backup.");
-    }
-  };
-
-  const handleGridKeyDown = async (
-    event: React.KeyboardEvent<HTMLDivElement>
-  ) => {
-    const target = event.target as HTMLElement;
-    const isInput =
-      target.tagName === "INPUT" || target.tagName === "TEXTAREA";
-
-    if (isInput) {
-      return;
-    }
-
-    if (event.ctrlKey && event.key.toLowerCase() === "z") {
+    if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === "z") {
       event.preventDefault();
-      undo();
+
+      if (event.shiftKey) redo();
+      else undo();
+
       return;
     }
 
-    if (
-      event.ctrlKey &&
-      (event.key.toLowerCase() === "y" ||
-        (event.shiftKey && event.key.toLowerCase() === "z"))
-    ) {
+    if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === "y") {
       event.preventDefault();
       redo();
       return;
     }
 
-    if (event.ctrlKey && event.key.toLowerCase() === "c") {
+    if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === "c") {
       event.preventDefault();
-      await copySelectedCells();
+      void copySelection();
       return;
     }
 
-    if (event.ctrlKey && event.key.toLowerCase() === "v") {
+    if (key === "Delete" || key === "Backspace") {
       event.preventDefault();
-      await pasteCells();
+
+      const nextSheets = cloneSheets(sheets);
+      const target = nextSheets.find(
+        (sheet) => sheet.id === activeSheetId,
+      );
+
+      if (!target) return;
+
+      for (const position of selectedPositions) {
+        delete target.cells[addressOf(position)];
+      }
+
+      setSheets(nextSheets);
+      recordHistory(nextSheets, activeSheetId, selection);
       return;
     }
 
-    if (event.key === "Delete" || event.key === "Backspace") {
+    const next = { ...selection.start };
+
+    if (key === "ArrowUp") next.row = Math.max(1, next.row - 1);
+    else if (key === "ArrowDown") next.row += 1;
+    else if (key === "ArrowLeft") next.col = Math.max(1, next.col - 1);
+    else if (key === "ArrowRight") next.col += 1;
+    else if (key === "Enter") {
       event.preventDefault();
-      clearSelectedCells();
+      startEditing(activeAddress);
       return;
-    }
-
-    if (event.key === "F2") {
+    } else if (key === "Tab") {
+      next.col += event.shiftKey ? -1 : 1;
+      next.col = Math.max(1, next.col);
+    } else if (key === "F2") {
       event.preventDefault();
-      startEditing(activeCell);
+      startEditing(activeAddress);
       return;
-    }
-
-    const position = getCellPosition(activeCell);
-
-    if (!position) {
+    } else if (key === "Escape") {
+      setEditingCell(null);
       return;
-    }
-
-    let nextRow = position.row;
-    let nextColumn = position.column;
-
-    if (event.key === "ArrowUp") nextRow--;
-    else if (event.key === "ArrowDown") nextRow++;
-    else if (event.key === "ArrowLeft") nextColumn--;
-    else if (event.key === "ArrowRight") nextColumn++;
-    else if (event.key === "Enter") nextRow++;
-    else if (event.key === "Tab") nextColumn += event.shiftKey ? -1 : 1;
-    else if (
-      event.key.length === 1 &&
-      !event.ctrlKey &&
-      !event.metaKey &&
-      !event.altKey
-    ) {
-      event.preventDefault();
-      startEditing(activeCell, event.key);
+    } else if (key.length === 1 && !event.ctrlKey && !event.metaKey) {
+      startEditing(activeAddress, key);
       return;
     } else {
       return;
@@ -1074,394 +921,496 @@ export default function Home() {
 
     event.preventDefault();
 
-    nextRow = Math.max(1, Math.min(20, nextRow));
-    nextColumn = Math.max(1, Math.min(8, nextColumn));
+    const nextSelection = {
+      start: next,
+      end: next,
+    };
 
-    const nextAddress = `${getColumnName(nextColumn)}${nextRow}`;
+    setSelection(nextSelection);
+    updateURL(activeSheetId, addressOf(next));
+  }
 
-    if (event.shiftKey && event.key.startsWith("Arrow")) {
-      setSelectedRange((current) => ({
-        start: current.start,
-        end: nextAddress,
+  function startColumnResize(
+    event: React.MouseEvent<HTMLDivElement>,
+    col: number,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    resizeRef.current = {
+      col,
+      startX: event.clientX,
+      startWidth: columnWidths[col] ?? DEFAULT_COLUMN_WIDTH,
+    };
+
+    function onMouseMove(moveEvent: MouseEvent) {
+      if (!resizeRef.current) return;
+
+      const { col, startX, startWidth } = resizeRef.current;
+      const width = Math.max(
+        60,
+        Math.min(400, startWidth + moveEvent.clientX - startX),
+      );
+
+      setColumnWidths((previous) => ({
+        ...previous,
+        [col]: width,
       }));
-      setActiveCell(nextAddress);
-    } else {
-      setActiveCell(nextAddress);
-      setSelectedRange({ start: nextAddress, end: nextAddress });
     }
-  };
 
-  const selectedAddresses = useMemo(
-    () => new Set(getRangeAddresses(selectedRange.start, selectedRange.end)),
-    [selectedRange]
-  );
+    function onMouseUp() {
+      resizeRef.current = null;
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    }
 
-  const formulaValue = editingCell
-    ? draft
-    : cellValues[activeCell] || "";
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+  }
 
-  const activeStyle = cellStyles[activeCell] || {};
+  async function resetFixtures() {
+    if (
+      !confirm(
+        "Reset the workbook to the original Budget, Big Sheet and Broken Sheet fixtures? Your current workbook will be replaced.",
+      )
+    ) {
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/fixtures/reset", {
+        method: "POST",
+      });
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.message ?? "Reset failed.");
+      }
+
+      setSheets(result.sheets);
+      setActiveSheetId(result.sheets[0].id);
+      setSelection(getInitialSelection());
+      setEditingCell(null);
+
+      setSaveState("saved");
+      setSaveMessage("");
+
+      recordHistory(
+        result.sheets,
+        result.sheets[0].id,
+        getInitialSelection(),
+      );
+
+      updateURL(result.sheets[0].id, "A1");
+    } catch (error) {
+      setSaveState("failed");
+      setSaveMessage(
+        error instanceof Error ? error.message : "Reset failed.",
+      );
+    }
+  }
+
+  function retrySave() {
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+    }
+
+    if (!sheets.length) return;
+
+    const sequence = ++saveSequenceRef.current;
+    latestSequenceRef.current = sequence;
+
+    setSaveState("saving");
+    setSaveMessage("");
+
+    void saveWorkbook(cloneSheets(sheets), sequence);
+  }
+
+  // Browser Back/Forward restores the sheet and active cell from the URL.
+  useEffect(() => {
+    function handlePopState() {
+      const url = new URL(window.location.href);
+      const sheetId = url.searchParams.get("sheet");
+      const cell = url.searchParams.get("cell");
+
+      if (sheetId && sheets.some((sheet) => sheet.id === sheetId)) {
+        setActiveSheetId(sheetId);
+      }
+
+      const position = cell ? parseAddress(cell) : null;
+
+      if (position) {
+        setSelection({
+          start: position,
+          end: position,
+        });
+      }
+    }
+
+    window.addEventListener("popstate", handlePopState);
+
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, [sheets]);
+
+  // Keep the active cell visible after keyboard navigation.
+  useEffect(() => {
+    const element = gridRef.current;
+
+    if (!element) return;
+
+    const top = (selection.start.row - 1) * ROW_HEIGHT;
+    const bottom = top + ROW_HEIGHT;
+
+    const visibleTop = element.scrollTop;
+    const visibleBottom = visibleTop + element.clientHeight;
+
+    if (top < visibleTop) {
+      element.scrollTop = top;
+    } else if (bottom > visibleBottom) {
+      element.scrollTop = bottom - element.clientHeight + ROW_HEIGHT;
+    }
+  }, [selection]);
+
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+      }
+    };
+  }, []);
+
+  if (!loaded) {
+    return (
+      <main className="app">
+        <div className="loading-state">Loading Small Sheet...</div>
+      </main>
+    );
+  }
 
   return (
-    <main className="app" onKeyDown={handleGridKeyDown} tabIndex={0}>
+    <main className="app" data-theme={darkMode ? "dark" : "light"}>
       <header className="toolbar">
         <h1>Small Sheet</h1>
 
         <div className="toolbar-actions">
-          <button onClick={undo}>Undo</button>
-          <button onClick={redo}>Redo</button>
-          <button onClick={createSheet}>+ New Sheet</button>
-          <button onClick={deleteSheet}>Delete Sheet</button>
+          <button onClick={undo} disabled={historyIndex <= 0}>
+            Undo
+          </button>
+
+          <button
+            onClick={redo}
+            disabled={historyIndex >= history.length - 1}
+          >
+            Redo
+          </button>
+
+          <button onClick={addSheet}>+ New Sheet</button>
+
+          <button onClick={deleteActiveSheet}>Delete Sheet</button>
+
+          <button onClick={() => setDarkMode((value) => !value)}>
+            {darkMode ? "Light mode" : "Dark mode"}
+          </button>
+
+          <button onClick={resetFixtures}>Reset fixtures</button>
         </div>
       </header>
 
-      <div className="format-toolbar">
-        <button
-          className={activeStyle.bold ? "format-active" : ""}
-          onClick={() => toggleStyle("bold")}
-          title="Bold"
-        >
-          <strong>B</strong>
-        </button>
-
-        <button
-          className={activeStyle.italic ? "format-active" : ""}
-          onClick={() => toggleStyle("italic")}
-          title="Italic"
-        >
-          <em>I</em>
-        </button>
-
-        <select
-          aria-label="Text alignment"
-          value={activeStyle.align || "left"}
-          onChange={(event) =>
-            applyStyle({
-              align: event.target.value as "left" | "center" | "right",
-            })
-          }
-        >
-          <option value="left">Align left</option>
-          <option value="center">Align center</option>
-          <option value="right">Align right</option>
-        </select>
-
-        <label className="color-control" title="Text color">
-          <span>A</span>
-          <input
-            type="color"
-            value={activeStyle.color || "#111827"}
-            onChange={(event) => applyStyle({ color: event.target.value })}
-          />
-        </label>
-
-        <label className="color-control" title="Cell background color">
-          <span>Fill</span>
-          <input
-            type="color"
-            value={activeStyle.backgroundColor || "#ffffff"}
-            onChange={(event) =>
-              applyStyle({ backgroundColor: event.target.value })
-            }
-          />
-        </label>
-
-        <button onClick={() => applyStyle({ color: undefined })}>
-          Clear text color
-        </button>
-
-        <button onClick={() => applyStyle({ backgroundColor: undefined })}>
-          Clear fill
-        </button>
-      </div>
-
-      <div className="file-toolbar">
-        <button onClick={exportCSV}>Export CSV</button>
-        <button onClick={() => csvInputRef.current?.click()}>
-          Import CSV
-        </button>
-        <button onClick={exportJSON}>Backup Workbook</button>
-        <button onClick={() => jsonInputRef.current?.click()}>
-          Restore Workbook
-        </button>
-
-        <input
-          ref={csvInputRef}
-          type="file"
-          accept=".csv,text/csv"
-          hidden
-          onChange={(event) => {
-            const file = event.target.files?.[0];
-
-            if (file) {
-              void importCSV(file);
-            }
-
-            event.target.value = "";
-          }}
-        />
-
-        <input
-          ref={jsonInputRef}
-          type="file"
-          accept=".json,application/json"
-          hidden
-          onChange={(event) => {
-            const file = event.target.files?.[0];
-
-            if (file) {
-              void importJSON(file);
-            }
-
-            event.target.value = "";
-          }}
-        />
-      </div>
+      {loadError && (
+        <div className="error-message" role="alert">
+          {loadError}
+        </div>
+      )}
 
       <div className="formula-bar">
-        <div className="cell-reference">{activeCell}</div>
-
-        <div className="formula-symbol">fx</div>
+        <div className="formula-address">{activeAddress}</div>
 
         <input
-          value={formulaValue}
-          onChange={(event) => {
-            if (!editingCell) {
-              setEditingCell(activeCell);
-            }
-
-            setDraft(event.target.value);
-          }}
-          onFocus={() => {
-            if (!editingCell) {
-              setEditingCell(activeCell);
-              setDraft(cellValues[activeCell] || "");
-            }
-          }}
+          ref={formulaRef}
+          aria-label="Formula bar"
+          value={formulaDraft}
+          onChange={(event) => setFormulaDraft(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === "Tab") {
+            if (event.key === "Enter") {
               event.preventDefault();
-
-              const position = getCellPosition(activeCell);
-
-              if (position) {
-                const nextColumn =
-                  event.key === "Tab"
-                    ? Math.max(
-                        1,
-                        Math.min(8, position.column + (event.shiftKey ? -1 : 1))
-                      )
-                    : position.column;
-
-                const nextRow =
-                  event.key === "Enter"
-                    ? Math.max(1, Math.min(20, position.row + 1))
-                    : position.row;
-
-                finishEditing(
-                  `${getColumnName(nextColumn)}${nextRow}`
-                );
-              }
+              applyFormulaBar();
             }
 
             if (event.key === "Escape") {
-              setEditingCell(null);
-              setDraft("");
+              setFormulaDraft(activeRawValue);
+              formulaRef.current?.blur();
             }
           }}
-          placeholder="Enter a value or formula"
+          onBlur={() => {
+            if (formulaDraft !== activeRawValue) {
+              applyFormulaBar();
+            }
+          }}
+          placeholder="Enter a value or formula, for example =SUM(A1:A5)"
         />
       </div>
 
-      <div className="sheet-container">
-        <table className="sheet-grid">
-          <thead>
-            <tr>
-              <th className="row-header"></th>
-              {COLUMNS.map((column) => (
-                <th key={column}>{column}</th>
-              ))}
-            </tr>
-          </thead>
+      <div
+        className="sheet-container"
+        ref={gridRef}
+        tabIndex={0}
+        onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+        onKeyDown={handleGridKeyDown}
+        onPaste={handleGridPaste}
+        onCopy={handleGridCopy}
+        onMouseUp={() => setDraggingSelection(false)}
+      >
+        {activeSheet ? (
+          <table className="sheet-grid">
+            <colgroup>
+              <col style={{ width: ROW_HEADER_WIDTH }} />
 
-          <tbody>
-            {ROWS.map((row) => (
-              <tr key={row}>
-                <th className="row-header">{row}</th>
+              {Array.from({ length: COLUMN_COUNT }, (_, index) => {
+                const col = index + 1;
 
-                {COLUMNS.map((column) => {
-                  const address = getCellAddress(row, column);
-                  const isActive = activeCell === address;
-                  const isSelected = selectedAddresses.has(address);
-                  const style = cellStyles[address] || {};
-                  const displayValue = calculateCell(address, cellValues);
+                return (
+                  <col
+                    key={col}
+                    style={{
+                      width:
+                        columnWidths[col] ?? DEFAULT_COLUMN_WIDTH,
+                    }}
+                  />
+                );
+              })}
+            </colgroup>
+
+            <thead>
+              <tr>
+                <th className="corner-header" />
+
+                {Array.from({ length: COLUMN_COUNT }, (_, index) => {
+                  const col = index + 1;
 
                   return (
-                    <td
-                      key={address}
-                      className={[
-                        isActive ? "active-cell" : "",
-                        isSelected ? "range-selected" : "",
-                      ]
-                        .filter(Boolean)
-                        .join(" ")}
-                      onMouseDown={(event) => {
-                        if (event.shiftKey) {
-                          setSelectedRange((current) => ({
-                            start: current.start,
-                            end: address,
-                          }));
-                        } else {
-                          setSelectedRange({
-                            start: address,
-                            end: address,
-                          });
-                        }
-
-                        setActiveCell(address);
-                        setEditingCell(null);
-                        isDraggingRef.current = true;
-                      }}
-                      onMouseEnter={() => {
-                        if (isDraggingRef.current) {
-                          setSelectedRange((current) => ({
-                            start: current.start,
-                            end: address,
-                          }));
-                          setActiveCell(address);
-                        }
-                      }}
-                      onDoubleClick={() => startEditing(address)}
+                    <th
+                      key={col}
+                      className={`column-header ${
+                        selection.start.col === col ? "selected-header" : ""
+                      }`}
                     >
-                      {editingCell === address ? (
-                        <input
-                          className="cell-input"
-                          value={draft}
-                          autoFocus
-                          onChange={(event) => setDraft(event.target.value)}
-                          onBlur={() => finishEditing()}
-                          onKeyDown={(event) => {
-                            if (
-                              event.key === "Enter" ||
-                              event.key === "Tab"
-                            ) {
-                              event.preventDefault();
+                      {columnName(col)}
 
-                              const position = getCellPosition(address);
-
-                              if (position) {
-                                const nextColumn =
-                                  event.key === "Tab"
-                                    ? Math.max(
-                                        1,
-                                        Math.min(
-                                          8,
-                                          position.column +
-                                            (event.shiftKey ? -1 : 1)
-                                        )
-                                      )
-                                    : position.column;
-
-                                const nextRow =
-                                  event.key === "Enter"
-                                    ? Math.max(
-                                        1,
-                                        Math.min(20, position.row + 1)
-                                      )
-                                    : position.row;
-
-                                finishEditing(
-                                  `${getColumnName(nextColumn)}${nextRow}`
-                                );
-                              }
-                            }
-
-                            if (event.key === "Escape") {
-                              setEditingCell(null);
-                              setDraft("");
-                            }
-                          }}
-                          style={{
-                            fontWeight: style.bold ? "bold" : "normal",
-                            fontStyle: style.italic ? "italic" : "normal",
-                            textAlign: style.align || "left",
-                            color: style.color || "#111827",
-                            backgroundColor:
-                              style.backgroundColor || "transparent",
-                          }}
-                        />
-                      ) : (
-                        <div
-                          className="cell-display"
-                          style={{
-                            fontWeight: style.bold ? "bold" : "normal",
-                            fontStyle: style.italic ? "italic" : "normal",
-                            textAlign: style.align || "left",
-                            color: style.color || "#111827",
-                            backgroundColor:
-                              style.backgroundColor || "transparent",
-                          }}
-                        >
-                          {displayValue}
-                        </div>
-                      )}
-                    </td>
+                      <div
+                        className="column-resize-handle"
+                        onMouseDown={(event) =>
+                          startColumnResize(event, col)
+                        }
+                      />
+                    </th>
                   );
                 })}
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+
+            <tbody>
+              <tr style={{ height: Math.max(0, firstVisibleRow - 1) * ROW_HEIGHT }}>
+                <td
+                  colSpan={COLUMN_COUNT + 1}
+                  style={{
+                    height: Math.max(0, firstVisibleRow - 1) * ROW_HEIGHT,
+                    padding: 0,
+                    border: 0,
+                  }}
+                />
+              </tr>
+
+              {visibleRows.map((row) => (
+                <tr key={row}>
+                  <th
+                    className={`row-header ${
+                      selection.start.row === row ? "selected-header" : ""
+                    }`}
+                  >
+                    {row}
+                  </th>
+
+                  {Array.from({ length: COLUMN_COUNT }, (_, index) => {
+                    const col = index + 1;
+                    const address = addressOf({ row, col });
+                    const raw = activeSheet.cells[address] ?? "";
+                    const value = formulaResults.values[address] ?? raw;
+
+                    const active = address === activeAddress;
+                    const selected = isSelected(row, col);
+                    const editing = editingCell === address;
+                    const computed = raw.startsWith("=");
+                    const broken =
+                      typeof value === "string" && value.startsWith("#");
+
+                    return (
+                      <td
+                        key={address}
+                        className={[
+                          active ? "active-cell" : "",
+                          selected ? "range-selected" : "",
+                          editing ? "editing-cell" : "",
+                          computed ? "computed-cell" : "",
+                          broken ? "broken-cell" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
+                        onMouseDown={(event) => {
+                          if (event.button !== 0) return;
+
+                          if (editingCell) finishEditing();
+
+                          setDraggingSelection(true);
+
+                          if (event.shiftKey) {
+                            selectCell(row, col, true);
+                          } else {
+                            selectCell(row, col);
+                          }
+
+                          gridRef.current?.focus();
+                        }}
+                        onMouseEnter={() => {
+                          if (draggingSelection) {
+                            selectCell(row, col, true);
+                          }
+                        }}
+                        onDoubleClick={() => {
+                          startEditing(address);
+                        }}
+                      >
+                        {editing ? (
+                          <input
+                            ref={editorRef}
+                            className="cell-input"
+                            value={draft}
+                            onChange={(event) =>
+                              setDraft(event.target.value)
+                            }
+                            onBlur={() => finishEditing()}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                finishEditing("down");
+                              }
+
+                              if (event.key === "Tab") {
+                                event.preventDefault();
+                                finishEditing(
+                                  event.shiftKey ? "left" : "right",
+                                );
+                              }
+
+                              if (event.key === "Escape") {
+                                event.preventDefault();
+                                setEditingCell(null);
+                              }
+                            }}
+                          />
+                        ) : (
+                          <div className="cell-display">
+                            {value}
+                          </div>
+                        )}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+
+              <tr>
+                <td
+                  colSpan={COLUMN_COUNT + 1}
+                  style={{
+                    height:
+                      Math.max(
+                        0,
+                        INITIAL_ROW_COUNT - lastVisibleRow,
+                      ) * ROW_HEIGHT,
+                    padding: 0,
+                    border: 0,
+                  }}
+                />
+              </tr>
+            </tbody>
+          </table>
+        ) : (
+          <div className="empty-state">
+            <h2>No sheet selected</h2>
+            <p>Create a new sheet to start working.</p>
+          </div>
+        )}
       </div>
 
       <footer className="sheet-footer">
         <div className="sheet-tabs">
           {sheets.map((sheet) => (
-            <div
-              key={sheet.id}
-              className={`sheet-tab ${
-                sheet.id === activeSheetId ? "active-tab" : ""
-              }`}
-            >
-              <button onClick={() => switchSheet(sheet.id)}>
-                {sheet.name}
-              </button>
+            <div key={sheet.id}>
+              {renamingSheetId === sheet.id ? (
+                <input
+                  className="rename-tab"
+                  autoFocus
+                  value={renameValue}
+                  onChange={(event) =>
+                    setRenameValue(event.target.value)
+                  }
+                  onBlur={finishRename}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") finishRename();
 
-              <button
-                className="rename-tab"
-                onClick={() => renameSheet(sheet.id)}
-                title="Rename sheet"
-              >
-                ✎
-              </button>
+                    if (event.key === "Escape") {
+                      setRenamingSheetId(null);
+                    }
+                  }}
+                />
+              ) : (
+                <button
+                  className={
+                    sheet.id === activeSheetId ? "active-tab" : ""
+                  }
+                  onClick={() => switchSheet(sheet.id)}
+                  onDoubleClick={() => beginRename(sheet)}
+                  title="Double-click to rename"
+                >
+                  {sheet.name}
+                </button>
+              )}
             </div>
           ))}
         </div>
 
-        <div className="status-bar">
-          <span>{saveStatus}</span>
-          <span>
-            SUM:{" "}
-            {getRangeAddresses(
-              selectedRange.start,
-              selectedRange.end
-            )
-              .map((address) => Number(calculateCell(address, cellValues)))
-              .filter(Number.isFinite)
-              .reduce((total, value) => total + value, 0)}
-          </span>
-          <span>
-            COUNT:{" "}
-            {getRangeAddresses(
-              selectedRange.start,
-              selectedRange.end
-            ).filter((address) => {
-              const value = calculateCell(address, cellValues);
-              return value.trim() !== "" && Number.isFinite(Number(value));
-            }).length}
-          </span>
+        <div className="selection-summary">
+          <span>{selectedAddress}</span>
+          <span>Double-click a tab to rename</span>
         </div>
       </footer>
+
+      <div className="status-bar">
+        <div className="status-left">
+          <span>Sum: {selectionStats.sum.toLocaleString()}</span>
+          <span>
+            Average: {selectionStats.average.toLocaleString()}
+          </span>
+          <span>Count: {selectionStats.count}</span>
+        </div>
+
+        <div className="status-right">
+          <span className={`save-status ${saveState}`}>
+            {saveState === "saved" && "● Saved"}
+            {saveState === "saving" && "● Saving..."}
+            {saveState === "failed" && "● Save failed"}
+          </span>
+
+          {saveState === "failed" && (
+            <button onClick={retrySave}>Retry save</button>
+          )}
+
+          {saveMessage && <span>{saveMessage}</span>}
+        </div>
+      </div>
     </main>
   );
 }
